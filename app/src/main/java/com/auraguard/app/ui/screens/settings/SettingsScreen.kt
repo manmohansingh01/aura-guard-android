@@ -123,6 +123,7 @@ fun SettingsScreen(viewModel: AuraViewModel) {
 private fun detectorEngineLabel(status: com.auraguard.app.ai.DetectorStatus): String = when (status) {
     com.auraguard.app.ai.DetectorStatus.READY -> "TensorFlow Lite (on-device)"
     com.auraguard.app.ai.DetectorStatus.SIMULATED -> "Simulated (no model file bundled)"
+    com.auraguard.app.ai.DetectorStatus.MOTION_CV -> "Motion CV (frame-difference tracking, no trained model)"
     com.auraguard.app.ai.DetectorStatus.NO_MODEL -> "No model loaded"
     com.auraguard.app.ai.DetectorStatus.LOADING -> "Loading..."
     com.auraguard.app.ai.DetectorStatus.ERROR -> "Error"
