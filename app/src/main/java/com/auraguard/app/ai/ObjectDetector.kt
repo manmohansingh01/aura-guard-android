@@ -4,7 +4,7 @@ import android.graphics.Bitmap
 import com.auraguard.app.core.Detection
 import kotlinx.coroutines.flow.StateFlow
 
-enum class DetectorStatus { LOADING, READY, NO_MODEL, ERROR, SIMULATED }
+enum class DetectorStatus { LOADING, READY, NO_MODEL, ERROR, SIMULATED, MOTION_CV }
 
 /**
  * "AI Detector" stage of the pipeline. Deliberately a narrow interface —
