@@ -111,6 +111,7 @@ private fun inferenceLabel(status: DetectorStatus): String = when (status) {
     DetectorStatus.NO_MODEL -> "NO MODEL"
     DetectorStatus.ERROR -> "ERROR"
     DetectorStatus.SIMULATED -> "SIMULATED"
+    DetectorStatus.MOTION_CV -> "MOTION CV"
 }
 
 private fun inferenceColor(status: DetectorStatus): Color = when (status) {
@@ -119,6 +120,7 @@ private fun inferenceColor(status: DetectorStatus): Color = when (status) {
     DetectorStatus.NO_MODEL -> OpsWarning
     DetectorStatus.ERROR -> OpsCritical
     DetectorStatus.SIMULATED -> OpsWarning
+    DetectorStatus.MOTION_CV -> OpsWarning
 }
 
 private fun alertColor(level: AlertLevel): Color = when (level) {
