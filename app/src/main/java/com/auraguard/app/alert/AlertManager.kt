@@ -80,7 +80,7 @@ class AlertManager(private val context: Context) {
     }
 
     private fun vibrate(level: AlertLevel) {
-        val vibrator: Vibrator? = try {
+        val vibrator = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
             } else {
