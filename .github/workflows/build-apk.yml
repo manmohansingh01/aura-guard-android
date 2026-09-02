@@ -1,0 +1,46 @@
+name: Build AURA Guard APK
+
+# Builds a debug APK on every push/PR to main, and on demand from the
+# Actions tab (workflow_dispatch). GitHub's runners have full internet
+# access to Google's/Maven's repositories, so this is the easiest way to
+# get a real compiled .apk out of this project without installing Android
+# Studio locally.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # This repo's gradle/wrapper/gradle-wrapper.jar binary could not be
+      # generated in the sandboxed environment this project was assembled
+      # in (no network access to services.gradle.org), so rather than rely
+      # on a possibly-broken ./gradlew, install Gradle 8.7 directly on the
+      # runner (which has full internet access) and invoke it directly.
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-guard-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
