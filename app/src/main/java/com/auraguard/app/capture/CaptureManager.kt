@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+
 package com.auraguard.app.capture
 
 import android.content.Context
@@ -47,7 +49,6 @@ class CaptureManager(private val appContext: Context) {
     private val _fps = MutableStateFlow(0f)
     val fps: StateFlow<Float> = _fps.asStateFlow()
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     val frames: Flow<Bitmap> = _activeSource.flatMapLatest { source ->
         when (source) {
             InputSource.SCREEN_CAPTURE -> screenSource.frames
@@ -56,7 +57,6 @@ class CaptureManager(private val appContext: Context) {
         }
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     init {
         _activeSource.flatMapLatest { source ->
             when (source) {
