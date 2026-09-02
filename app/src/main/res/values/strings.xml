@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AURA Guard</string>
+    <string name="capture_notification_channel">AURA Guard Monitoring</string>
+    <string name="capture_notification_title">AURA GUARD — SYSTEM ACTIVE</string>
+    <string name="capture_notification_text">Perimeter monitoring is running in the background</string>
+</resources>
