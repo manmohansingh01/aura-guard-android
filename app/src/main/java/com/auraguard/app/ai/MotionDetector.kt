@@ -35,8 +35,8 @@ import kotlin.math.abs
  */
 class MotionDetector(
     private val gridCols: Int = 64,
-    private val minClusterCells: Int = 4,
-    private val deltaThreshold: Float = 14f,
+    private val minClusterCells: Int = 7,
+    private val deltaThreshold: Float = 20f,
     private val maxBlobs: Int = 2
 ) : ObjectDetector {
 
