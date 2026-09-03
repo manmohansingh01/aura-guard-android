@@ -11,19 +11,38 @@ import kotlin.math.abs
 /**
  * A real (not scripted) fallback detector used when no trained .tflite
  * model is bundled — see MODEL_SETUP.md; shipping pretrained weights was
- * deliberately left out of this repo. The old fallback ([SimulatedDetector])
- * animated a box along a fixed sine-wave path that had nothing to do with
- * the actual video/screen content, which is why its box did not track a
- * real moving person or object — it wasn't supposed to.
+ * deliberately left out of this repo.
  *
- * This detector instead finds bounding boxes for whatever is *actually*
- * moving in the frame via consecutive-frame differencing — the same
- * block-mean-luminance technique `change/ChangeDetectionEngine.kt` already
- * uses for zone-level change alerts, just run across the whole frame and
- * against the *previous* frame (a rolling reference) instead of a fixed
- * per-zone baseline. A genuinely moving person or vehicle now produces a
- * box whose position is computed from real pixel motion each frame, so it
- * stays locked to the object instead of wandering on its own.
+ * v1 of this detector diffed each frame against the *previous* frame (a
+ * rolling reference). That had two real bugs reported from live footage:
+ *
+ *   1. A person or vehicle that stood still for more than a couple of
+ *      frames got silently absorbed into the rolling reference — each
+ *      frame nudged the reference 45% of the way toward the *current*
+ *      frame, so a stationary object stopped producing any delta at all
+ *      within well under a second, and a genuine "person is now standing
+ *      inside the zone" stopped being reported as anything.
+ *   2. Because it compared two individually noisy frames against each
+ *      other (sensor noise + video-compression artifacts in *both*
+ *      frames), the effective noise floor was higher than diffing against
+ *      a stable reference — on a visually busy but empty background (sand,
+ *      dust, heat shimmer) that noise regularly crossed the threshold and
+ *      produced phantom "OBJECT" boxes where nothing was there.
+ *
+ * This version instead maintains a genuine background model: a reference
+ * built by averaging the first few frames after the detector is (re)armed,
+ * then adapted very slowly afterward — and, critically, *only* for cells
+ * NOT currently flagged as foreground. That second part is what fixes bug
+ * #1: a real object keeps differing from the background for as long as it
+ * stays in view, because the pixels it covers are excluded from the
+ * background update while it's there. It also improves on bug #2, since
+ * a multi-frame-averaged reference carries much less noise than a single
+ * previous raw frame, so the same threshold now rejects far more sensor/
+ * compression noise without needing to be raised so high that it misses
+ * real objects. A morphological neighbor filter (used the same way
+ * `change/ChangeDetectionEngine.kt` filters its own grid) additionally
+ * discards isolated flickering cells before they can ever reach the
+ * minimum-cluster-size check.
  *
  * This is still not object *classification* — everything found is reported
  * as a generic "OBJECT" — which is why the UI keeps showing INFERENCE
@@ -35,18 +54,23 @@ import kotlin.math.abs
  */
 class MotionDetector(
     private val gridCols: Int = 64,
-    private val minClusterCells: Int = 7,
-    private val deltaThreshold: Float = 20f,
-    private val maxBlobs: Int = 2
+    private val minClusterCells: Int = 9,
+    private val deltaThreshold: Float = 24f,
+    private val maxBlobs: Int = 2,
+    /** How much of each new frame blends into the background, per frame, for cells not currently foreground. */
+    private val backgroundLearningRate: Float = 0.04f,
+    /** Frames spent building the initial background average before any detection is reported. */
+    private val calibrationFrames: Int = 4
 ) : ObjectDetector {
 
     private val _status = MutableStateFlow(DetectorStatus.MOTION_CV)
     override val status: StateFlow<DetectorStatus> = _status
-    override val modelInfo: String = "MOTION CV — frame-difference blob tracking (no trained model)"
+    override val modelInfo: String = "MOTION CV — background-subtraction blob tracking (no trained model)"
 
-    private var prevGray: FloatArray? = null
-    private var prevCols = 0
-    private var prevRows = 0
+    private var background: FloatArray? = null
+    private var bgCols = 0
+    private var bgRows = 0
+    private var calibrationFramesLeft = 0
 
     override fun detect(bitmap: Bitmap): List<Detection> {
         val w = bitmap.width
@@ -58,26 +82,59 @@ class MotionDetector(
 
         val gray = computeGrayGrid(bitmap, cols, rows)
 
-        val prev = prevGray
-        if (prev == null || prevCols != cols || prevRows != rows) {
-            prevGray = gray
-            prevCols = cols
-            prevRows = rows
+        val bg = background
+        if (bg == null || bgCols != cols || bgRows != rows) {
+            background = gray.copyOf()
+            bgCols = cols
+            bgRows = rows
+            calibrationFramesLeft = calibrationFrames
             return emptyList()
         }
 
-        val changed = BooleanArray(gray.size)
-        for (i in gray.indices) {
-            changed[i] = abs(gray[i] - prev[i]) > deltaThreshold
+        // Keep averaging every cell into the background for the first few frames after (re)arming,
+        // so a single unlucky noisy frame never becomes the permanent reference. Nothing is reported
+        // as a detection yet since there's no "before" to compare against.
+        if (calibrationFramesLeft > 0) {
+            for (i in gray.indices) {
+                bg[i] = bg[i] * 0.5f + gray[i] * 0.5f
+            }
+            calibrationFramesLeft--
+            return emptyList()
         }
 
-        // Roll the reference frame slowly toward the current one. This is what
-        // makes the box track a *moving* object frame-to-frame (each new
-        // position differs from the recent, not a far-past, reference) while
-        // still letting a briefly-still object stay detected for a couple of
-        // frames instead of vanishing the instant it pauses.
+        val rawChanged = BooleanArray(gray.size)
         for (i in gray.indices) {
-            prev[i] = prev[i] * 0.55f + gray[i] * 0.45f
+            rawChanged[i] = abs(gray[i] - bg[i]) > deltaThreshold
+        }
+
+        // Morphological filter: a cell only counts as changed if at least 2 of its 8 neighbors also
+        // changed. Kills the single/double isolated-cell flicker (dust, heat shimmer, compression
+        // noise) that a raw per-cell threshold lets through, without needing a higher threshold that
+        // would also blind the detector to smaller real objects.
+        val changed = BooleanArray(gray.size)
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                val idx = r * cols + c
+                if (!rawChanged[idx]) continue
+                var neighbors = 0
+                for (dr in -1..1) for (dc in -1..1) {
+                    if (dr == 0 && dc == 0) continue
+                    val nr = r + dr; val nc = c + dc
+                    if (nr in 0 until rows && nc in 0 until cols && rawChanged[nr * cols + nc]) neighbors++
+                }
+                if (neighbors >= 2) changed[idx] = true
+            }
+        }
+
+        // Only cells NOT currently flagged as changed get folded into the background. This is what
+        // keeps a real, stationary object from disappearing into the reference the way the old
+        // frame-to-frame version did — its pixels are excluded from the update for as long as it's
+        // there, so it keeps reading as "different from background" instead of quietly becoming the
+        // new normal.
+        for (i in gray.indices) {
+            if (!changed[i]) {
+                bg[i] = bg[i] * (1 - backgroundLearningRate) + gray[i] * backgroundLearningRate
+            }
         }
 
         return extractBlobs(changed, cols, rows)
@@ -172,6 +229,6 @@ class MotionDetector(
     private operator fun IntArray.component5() = this[4]
 
     override fun close() {
-        prevGray = null
+        background = null
     }
 }
