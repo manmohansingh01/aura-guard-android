@@ -55,6 +55,10 @@ import java.util.UUID
  */
 class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
+    // Stored explicitly (rather than relying on the inherited getApplication()) so it's usable
+    // from ordinary member functions below, not just class-body property initializers.
+    private val appContext: Application = application
+
     val settingsRepository: SettingsRepository =
         (application as? AuraGuardApp)?.settingsRepository ?: SettingsRepository(application)
 
@@ -65,8 +69,22 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val alertManager = AlertManager(application)
     val eventRepository = EventRepository(application)
 
+    // Kept only as a status/model-info probe for the UI (Settings "System Info", the top status
+    // bar) — actual detection no longer runs on this instance; see [detectorFor] and
+    // [detectWithinZones] below for why detection is scoped per-zone instead of one shared engine.
     private val detector: ObjectDetector =
         DetectorProvider.create(application) { settings.value.detectionConfidenceThreshold }
+
+    // One detector instance per armed zone, so detection runs only on that zone's cropped region.
+    // A stateful engine (MotionDetector rolls a reference frame forward) needs its own instance per
+    // zone — feeding it alternating crops from different zones would make every zone look like
+    // constant motion relative to the last. Created lazily, closed when a zone is removed.
+    private val zoneDetectors = mutableMapOf<String, ObjectDetector>()
+
+    private fun detectorFor(zoneId: String): ObjectDetector =
+        zoneDetectors.getOrPut(zoneId) {
+            DetectorProvider.create(appContext) { settings.value.detectionConfidenceThreshold }
+        }
 
     private val rateLimiter = FrameRateLimiter(ProcessingRate.MEDIUM.targetFps)
     private val inferenceFpsMeter = InferenceFpsMeter()
@@ -126,7 +144,8 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
         withContext(Dispatchers.Default) {
             val threshold = settings.value.detectionConfidenceThreshold
-            val detections = detector.detect(bitmap).filter { it.confidence >= threshold }
+            val armedZones = _zones.value.filter { it.armed && it.isClosed }
+            val detections = detectWithinZones(bitmap, armedZones, threshold)
             val tracked = tracker.update(detections)
 
             val evaluation = perimeterEngine.evaluate(_zones.value, tracked)
@@ -155,6 +174,43 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             runChangeDetection(bitmap)
         }
     }
+
+    /**
+     * Runs the AI Detector stage ONLY inside each armed zone's rectangular bounding box — never
+     * across the whole frame. This is what makes detection "work inside the zone and not before":
+     * an object standing anywhere outside every defined zone is never fed to the detector at all,
+     * so it can't produce a box, a track, a trail, or a count — there's simply nothing to report
+     * until the object is within a zone's region. With no armed zone defined yet, this returns no
+     * detections at all (nothing to scope detection to).
+     *
+     * Each zone gets its own [detectorFor] instance rather than sharing one across zones/the whole
+     * frame, since a stateful engine (MotionDetector) rolls a reference frame forward — reusing one
+     * instance across two different zones' crops would make each new zone's first frame look like
+     * violent motion relative to the previous zone's content.
+     */
+    private fun detectWithinZones(frame: Bitmap, armedZones: List<Zone>, threshold: Float): List<Detection> {
+        if (armedZones.isEmpty()) return emptyList()
+        val results = mutableListOf<Detection>()
+        for (zone in armedZones) {
+            val bbox = PolygonMath.boundingBox(zone.points)
+            val roiRect = NormRect(bbox[0], bbox[1], bbox[2], bbox[3])
+            if (roiRect.width <= 0.01f || roiRect.height <= 0.01f) continue
+            val roi = FrameProcessor.crop(frame, roiRect) ?: continue
+            val zoneDetections = detectorFor(zone.id).detect(roi).filter { it.confidence >= threshold }
+            for (d in zoneDetections) {
+                results += d.copy(box = mapRoiBoxToFrame(d.box, roiRect))
+            }
+        }
+        return results
+    }
+
+    /** Converts a detection box normalized to a zone's cropped ROI back into full-frame normalized coordinates. */
+    private fun mapRoiBoxToFrame(box: NormRect, roi: NormRect): NormRect = NormRect(
+        left = roi.left + box.left * roi.width,
+        top = roi.top + box.top * roi.height,
+        right = roi.left + box.right * roi.width,
+        bottom = roi.top + box.bottom * roi.height
+    )
 
     private fun onPerimeterTransition(obj: TrackedObject, prev: PerimeterState, new: PerimeterState, frame: Bitmap) {
         val zoneName = obj.relevantZoneId?.let { id -> _zones.value.firstOrNull { it.id == id }?.name }
@@ -381,6 +437,10 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setZoneArmed(zoneId: String, armed: Boolean) {
         _zones.update { zones -> zones.map { if (it.id == zoneId) it.copy(armed = armed) else it } }
+        // Disarmed zones are never fed to detectWithinZones any more, so their detector instance
+        // (and, for MotionDetector, its rolling reference frame) is stale the moment it's unused —
+        // drop it now rather than leave it idle; re-arming lazily creates a fresh one via detectorFor.
+        if (!armed) zoneDetectors.remove(zoneId)?.close()
     }
 
     fun setZoneSensitivity(zoneId: String, sensitivity: Float) {
@@ -391,6 +451,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _zones.update { zones -> zones.filterNot { it.id == zoneId } }
         changeEngine.clearZone(zoneId)
         lastChangeAlertAtMs.remove(zoneId)
+        zoneDetectors.remove(zoneId)?.close()
     }
 
     fun resetZoneBaseline(zoneId: String) {
@@ -444,6 +505,8 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         detector.close()
+        zoneDetectors.values.forEach { it.close() }
+        zoneDetectors.clear()
         alertManager.release()
         captureManager.stopAll()
     }
