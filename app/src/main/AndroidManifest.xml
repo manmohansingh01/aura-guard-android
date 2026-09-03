@@ -10,6 +10,11 @@
     <!-- Audible + haptic alerts -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Floating overlay: draws detections, perimeter zones, alerts, and
+         perimeter controls directly on top of the drone app so the operator
+         never has to leave it. Optional — capture still works without it. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <!-- Demo mode: pick a prerecorded video from the device -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
