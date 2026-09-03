@@ -130,6 +130,10 @@ fun LiveScreen(viewModel: AuraViewModel, onRequestScreenCapture: () -> Unit) {
             )
         }
 
+        if (captureState == CaptureState.ACTIVE) {
+            OverlayHint()
+        }
+
         MiniDashboard(currentObjects, warnings, criticals, zones.size)
 
         if (editState.isActive) {
@@ -178,6 +182,35 @@ fun LiveScreen(viewModel: AuraViewModel, onRequestScreenCapture: () -> Unit) {
             }
         )
     }
+}
+
+/**
+ * Reminds the operator that AURA Guard's own screen is not the only place
+ * the feed can be watched from — the point of capturing another app's
+ * screen at all is that you're meant to be looking at THAT app, not this
+ * one. If AURA Guard is caught in the foreground while capture is active,
+ * it will simply capture its own window (the "hall of mirrors" of nested
+ * overlay screenshots), so this nudges the operator to switch away.
+ */
+@Composable
+private fun OverlayHint() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val overlayGranted = remember { android.provider.Settings.canDrawOverlays(context) }
+    val message = if (overlayGranted) {
+        "Capturing. Switch to your drone app now — the floating overlay keeps showing detections, zones, and controls on top of it."
+    } else {
+        "Capturing. Switch to your drone app now to view the real feed here; enable the floating overlay in Settings to see detections on top of it too."
+    }
+    Text(
+        message,
+        color = OpsInfo,
+        fontSize = 11.sp,
+        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(OpsSurface)
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+    )
 }
 
 @Composable
