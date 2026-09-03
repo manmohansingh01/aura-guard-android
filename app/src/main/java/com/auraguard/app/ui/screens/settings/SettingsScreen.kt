@@ -176,6 +176,7 @@ fun SettingsScreen(viewModel: AuraViewModel) {
         SectionCard("SYSTEM INFO") {
             InfoRow("Inference engine", detectorEngineLabel(detectorStatus))
             InfoRow("Model", viewModel.modelInfo)
+            InfoRow("Breach alerts", breachAlertLabel(detectorStatus))
             InfoRow("Offline mode", "All AI processing runs on-device. No network required.")
             InfoRow("Safety", "Human-in-the-loop only — AURA Guard never controls the drone.")
         }
@@ -189,6 +190,20 @@ private fun detectorEngineLabel(status: com.auraguard.app.ai.DetectorStatus): St
     com.auraguard.app.ai.DetectorStatus.NO_MODEL -> "No model loaded"
     com.auraguard.app.ai.DetectorStatus.LOADING -> "Loading..."
     com.auraguard.app.ai.DetectorStatus.ERROR -> "Error"
+}
+
+/**
+ * Alerts (the red banner, tone, and vibration) only fire for a *classified*
+ * person or vehicle — never for a generic motion blob — so a bag, curtain,
+ * or camera shake can no longer trigger a false "PERIMETER BREACH". Classification
+ * requires a real trained model (READY); every other engine state still logs
+ * what it sees to the Events tab, just quietly, with no siren.
+ */
+private fun breachAlertLabel(status: com.auraguard.app.ai.DetectorStatus): String = when (status) {
+    com.auraguard.app.ai.DetectorStatus.READY ->
+        "Enabled — fires for detected PERSON / vehicle classes only"
+    else ->
+        "Suppressed — no trained model to confirm person/vehicle (motion still logged in Events, see MODEL_SETUP.md)"
 }
 
 @Composable
