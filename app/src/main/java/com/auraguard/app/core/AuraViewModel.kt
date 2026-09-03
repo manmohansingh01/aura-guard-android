@@ -168,7 +168,10 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
      * so the marker on screen always matches what's actually different *this* frame: it can't drift
      * out of alignment with a moving object the way a tracked box can, and it can't outlive the
      * object that caused it — the instant the frame stops differing from baseline, there's nothing
-     * to mark.
+     * to mark. If a trained model is bundled (see [classifyChange]), the *same* frame's change is
+     * additionally run through it once, purely to upgrade "CHANGE" into a real label like "PERSON"
+     * — that's a one-shot lookup, not tracking, and is skipped entirely with no behavior change
+     * when no model is present.
      */
     private fun evaluateZone(zone: Zone, frame: Bitmap, markerId: Int): TrackedObject? {
         val bbox = PolygonMath.boundingBox(zone.points)
@@ -193,20 +196,49 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         setZoneState(zone.id, PerimeterState.BREACH)
 
         val regionInRoi = changeEngine.changedRegionWithinRoi(result)
-        val box = if (regionInRoi != null) mapRoiBoxToFrame(regionInRoi, roiRect) else roiRect
+        val classification = classifyChange(roi, regionInRoi)
+        val fallbackBox = if (regionInRoi != null) mapRoiBoxToFrame(regionInRoi, roiRect) else roiRect
+        val box = classification?.let { mapRoiBoxToFrame(it.box, roiRect) } ?: fallbackBox
 
-        maybeAlertChange(zone, roi, result.confidence)
+        maybeAlertChange(zone, roi, result.confidence, classification)
 
         return TrackedObject(
             id = markerId,
-            objectClass = ObjectClass.UNKNOWN,
-            label = "CHANGE",
-            confidence = result.confidence,
+            objectClass = classification?.let { ObjectClass.fromLabel(it.label) } ?: ObjectClass.UNKNOWN,
+            label = classification?.label ?: "CHANGE",
+            confidence = classification?.confidence ?: result.confidence,
             box = box,
             trail = emptyList(),
             perimeterState = PerimeterState.BREACH,
             relevantZoneId = zone.id
         )
+    }
+
+    /**
+     * Optional, stateless enrichment step: if — and only if — a real trained model is bundled and
+     * ready (see MODEL_SETUP.md / /colab/train_yolo26_visdrone.ipynb), run it once on the ROI a
+     * change was *already* found in, to see what caused the change. No identity is kept from this
+     * call to the next, so this is still not tracking — it just answers "what does this changed
+     * region look like right now?" the same way a human glancing at the crop would. Returns null
+     * (falling back to the generic "CHANGE" marker, exactly as before this existed) whenever no
+     * model is loaded, the model finds nothing relevant, or the fallback MotionDetector/simulated
+     * detector is what's active instead of a real classifier.
+     */
+    private fun classifyChange(roi: Bitmap, regionInRoi: NormRect?): Detection? {
+        if (detector.status.value != DetectorStatus.READY) return null
+        val detections = try {
+            detector.detect(roi)
+        } catch (t: Throwable) {
+            return null
+        }
+        if (detections.isEmpty()) return null
+        return if (regionInRoi != null) {
+            // Prefer whichever detection best overlaps the sub-region the change engine actually
+            // flagged, so a classified label doesn't get attached to an unrelated corner of the ROI.
+            detections.maxByOrNull { it.box.iou(regionInRoi) * 0.5f + it.confidence * 0.5f }
+        } else {
+            detections.maxByOrNull { it.confidence }
+        }
     }
 
     private fun setZoneState(zoneId: String, state: PerimeterState) {
@@ -221,8 +253,15 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         bottom = roi.top + box.bottom * roi.height
     )
 
-    /** Raises the CHANGE DETECTED alert for a zone, throttled so a change that persists across many frames re-alerts periodically instead of every single frame. */
-    private fun maybeAlertChange(zone: Zone, roi: Bitmap, confidence: Float) {
+    /**
+     * Raises the change alert for a zone, throttled so a change that persists across many frames
+     * re-alerts periodically instead of every single frame. When [classification] is non-null (a
+     * bundled model recognized something in the changed region), the alert and event log entry are
+     * labeled with that (e.g. "PERSON DETECTED"); otherwise this is the same generic "CHANGE
+     * DETECTED" alert as before — the event type stays CHANGE_DETECTED either way, since both are
+     * still purely change-triggered, not a persistent per-object classification.
+     */
+    private fun maybeAlertChange(zone: Zone, roi: Bitmap, confidence: Float, classification: Detection?) {
         val now = System.currentTimeMillis()
         val last = lastChangeAlertAtMs[zone.id] ?: 0L
         if (now - last < CHANGE_ALERT_COOLDOWN_MS) return
@@ -234,6 +273,14 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         val baselineSnapshot = changeEngine.getBaselineSnapshot(zone.id)
             ?.let { eventRepository.saveSnapshot(it, "change_baseline") }
 
+        val label = classification?.label
+        val effectiveConfidence = classification?.confidence ?: confidence
+        val message = if (label != null) {
+            "Change detected in Zone ${zone.name} — $label identified"
+        } else {
+            "Change detected in Zone ${zone.name} — something entered or moved"
+        }
+
         eventRepository.addEvent(
             AuraEvent(
                 id = UUID.randomUUID().toString(),
@@ -241,16 +288,17 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 type = EventType.CHANGE_DETECTED,
                 level = AlertLevel.WARNING,
                 zoneName = zone.name,
-                confidence = confidence,
-                message = "Change detected in Zone ${zone.name} — something entered or moved",
+                objectLabel = label,
+                confidence = effectiveConfidence,
+                message = message,
                 snapshotPath = currentSnapshot,
                 baselineSnapshotPath = baselineSnapshot
             )
         )
         alertManager.raise(
             level = AlertLevel.WARNING,
-            title = "CHANGE DETECTED",
-            subtitle = "Zone ${zone.name} · Change confidence: ${(confidence * 100).toInt()}%",
+            title = if (label != null) "$label DETECTED" else "CHANGE DETECTED",
+            subtitle = "Zone ${zone.name} · Confidence: ${(effectiveConfidence * 100).toInt()}%",
             zoneName = zone.name,
             audibleEnabled = s.audibleAlertsEnabled
         )
