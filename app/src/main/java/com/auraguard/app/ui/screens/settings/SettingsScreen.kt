@@ -165,6 +165,7 @@ fun SettingsScreen(viewModel: AuraViewModel) {
         SectionCard("SYSTEM INFO") {
             InfoRow("Zone watch engine", "Baseline change detection (per-zone), see MODEL_SETUP.md")
             InfoRow("Bundled model", detectorEngineLabel(detectorStatus))
+            InfoRow("Alert labeling", classificationLabel(detectorStatus))
             InfoRow("Change alerts", "Enabled — fires whenever an armed zone's content changes measurably (something entered or moved)")
             InfoRow("Offline mode", "All processing runs on-device. No network required.")
             InfoRow("Safety", "Human-in-the-loop only — AURA Guard never controls the drone.")
@@ -174,16 +175,28 @@ fun SettingsScreen(viewModel: AuraViewModel) {
 
 /**
  * Purely informational — whether a trained .tflite model happens to be bundled (see
- * MODEL_SETUP.md). Zone watching itself (see AuraViewModel.evaluateZone) doesn't use this at all;
- * it's a robust baseline-differencing check that works the same regardless of this status.
+ * MODEL_SETUP.md). Zone watching itself (see AuraViewModel.evaluateZone) doesn't depend on this at
+ * all — it's a robust baseline-differencing check that works the same regardless of this status.
  */
 private fun detectorEngineLabel(status: com.auraguard.app.ai.DetectorStatus): String = when (status) {
-    com.auraguard.app.ai.DetectorStatus.READY -> "TensorFlow Lite model present (not used for zone watching)"
+    com.auraguard.app.ai.DetectorStatus.READY -> "TensorFlow Lite model present"
     com.auraguard.app.ai.DetectorStatus.SIMULATED -> "None (simulated placeholder)"
     com.auraguard.app.ai.DetectorStatus.MOTION_CV -> "None bundled"
     com.auraguard.app.ai.DetectorStatus.NO_MODEL -> "None bundled"
     com.auraguard.app.ai.DetectorStatus.LOADING -> "Loading..."
     com.auraguard.app.ai.DetectorStatus.ERROR -> "Error"
+}
+
+/**
+ * Whether CHANGE DETECTED alerts get upgraded with a classified label (PERSON, CAR, ...) by
+ * running the bundled model once on a change the engine already found — see
+ * AuraViewModel.classifyChange(). No model bundled -> alerts stay generic "CHANGE DETECTED", which
+ * is still the full, working alert; this is a bonus on top, not a requirement.
+ */
+private fun classificationLabel(status: com.auraguard.app.ai.DetectorStatus): String = when (status) {
+    com.auraguard.app.ai.DetectorStatus.READY ->
+        "Enabled — changed regions get labeled (PERSON/CAR/etc.) when the model recognizes them"
+    else -> "Generic only — bundle a model (see MODEL_SETUP.md / colab/) to label what changed"
 }
 
 @Composable
