@@ -100,17 +100,6 @@ fun SettingsScreen(viewModel: AuraViewModel) {
             Text("Current inference throughput: ${"%.1f".format(inferenceFps)} FPS", color = OpsInfo, fontSize = 12.sp)
         }
 
-        SectionCard("DETECTION CONFIDENCE THRESHOLD") {
-            Text("Minimum confidence for a detection to be tracked and considered for perimeter/alert logic.", color = OpsTextSecondary, fontSize = 11.sp)
-            Text("${(settings.detectionConfidenceThreshold * 100).toInt()}%", color = OpsAccent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            Slider(
-                value = settings.detectionConfidenceThreshold,
-                onValueChange = { viewModel.setDetectionThreshold(it) },
-                valueRange = 0.2f..0.9f,
-                colors = SliderDefaults.colors(thumbColor = OpsAccent, activeTrackColor = OpsAccent)
-            )
-        }
-
         SectionCard("CHANGE DETECTION THRESHOLD") {
             Text(
                 "Fraction of a zone's area that must visibly change (after noise filtering) before a " +
@@ -174,36 +163,27 @@ fun SettingsScreen(viewModel: AuraViewModel) {
         }
 
         SectionCard("SYSTEM INFO") {
-            InfoRow("Inference engine", detectorEngineLabel(detectorStatus))
-            InfoRow("Model", viewModel.modelInfo)
-            InfoRow("Breach alerts", breachAlertLabel(detectorStatus))
-            InfoRow("Offline mode", "All AI processing runs on-device. No network required.")
+            InfoRow("Zone watch engine", "Baseline change detection (per-zone), see MODEL_SETUP.md")
+            InfoRow("Bundled model", detectorEngineLabel(detectorStatus))
+            InfoRow("Change alerts", "Enabled — fires whenever an armed zone's content changes measurably (something entered or moved)")
+            InfoRow("Offline mode", "All processing runs on-device. No network required.")
             InfoRow("Safety", "Human-in-the-loop only — AURA Guard never controls the drone.")
         }
     }
 }
 
+/**
+ * Purely informational — whether a trained .tflite model happens to be bundled (see
+ * MODEL_SETUP.md). Zone watching itself (see AuraViewModel.evaluateZone) doesn't use this at all;
+ * it's a robust baseline-differencing check that works the same regardless of this status.
+ */
 private fun detectorEngineLabel(status: com.auraguard.app.ai.DetectorStatus): String = when (status) {
-    com.auraguard.app.ai.DetectorStatus.READY -> "TensorFlow Lite (on-device)"
-    com.auraguard.app.ai.DetectorStatus.SIMULATED -> "Simulated (no model file bundled)"
-    com.auraguard.app.ai.DetectorStatus.MOTION_CV -> "Motion CV (frame-difference tracking, no trained model)"
-    com.auraguard.app.ai.DetectorStatus.NO_MODEL -> "No model loaded"
+    com.auraguard.app.ai.DetectorStatus.READY -> "TensorFlow Lite model present (not used for zone watching)"
+    com.auraguard.app.ai.DetectorStatus.SIMULATED -> "None (simulated placeholder)"
+    com.auraguard.app.ai.DetectorStatus.MOTION_CV -> "None bundled"
+    com.auraguard.app.ai.DetectorStatus.NO_MODEL -> "None bundled"
     com.auraguard.app.ai.DetectorStatus.LOADING -> "Loading..."
     com.auraguard.app.ai.DetectorStatus.ERROR -> "Error"
-}
-
-/**
- * Alerts (the red banner, tone, and vibration) only fire for a *classified*
- * person or vehicle — never for a generic motion blob — so a bag, curtain,
- * or camera shake can no longer trigger a false "PERIMETER BREACH". Classification
- * requires a real trained model (READY); every other engine state still logs
- * what it sees to the Events tab, just quietly, with no siren.
- */
-private fun breachAlertLabel(status: com.auraguard.app.ai.DetectorStatus): String = when (status) {
-    com.auraguard.app.ai.DetectorStatus.READY ->
-        "Enabled — fires for detected PERSON / vehicle classes only"
-    else ->
-        "Suppressed — no trained model to confirm person/vehicle (motion still logged in Events, see MODEL_SETUP.md)"
 }
 
 @Composable
