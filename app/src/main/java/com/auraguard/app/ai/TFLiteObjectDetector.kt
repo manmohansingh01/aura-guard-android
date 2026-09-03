@@ -27,11 +27,23 @@ import kotlin.math.min
  * ── Where to put the model ───────────────────────────────────────────────
  * Place a compatible model file at:
  *     app/src/main/assets/models/model.tflite
- * See app/src/main/assets/models/README.md for exactly where to obtain one
- * and how to export it. If no file is present, [status] becomes
- * [DetectorStatus.NO_MODEL] and detect() returns an empty list — the app
- * keeps running normally (see SimulatedDetector for pipeline testing
- * without any model).
+ * See app/src/main/assets/models/README.md and MODEL_SETUP.md for exactly
+ * where to obtain one and how to export it. If no file is present, [status]
+ * becomes [DetectorStatus.NO_MODEL] and detect() returns an empty list —
+ * the app keeps running normally on change-detection alone.
+ *
+ * ── Label set auto-detection ────────────────────────────────────────────
+ * The model's output head is inspected at load time to pick the right
+ * label/class mapping automatically, purely from how many classes the
+ * exported model has — no app config needed either way:
+ *   - 80 classes  -> [CocoLabels]      (stock/generic YOLO "coco" weights)
+ *   - 10 classes  -> [VisDroneLabels]  (a model fine-tuned per
+ *                     /colab/train_yolo26_visdrone.ipynb — recognizes
+ *                     overhead/aerial drone-view people & vehicles)
+ *   - anything else -> every class index is surfaced as a generic
+ *                     [com.auraguard.app.core.ObjectClass.UNKNOWN] "OBJECT"
+ *                     so a custom-trained model still produces detections
+ *                     instead of being silently filtered to nothing.
  *
  * ── Replacing this detector ─────────────────────────────────────────────
  * Everything downstream only depends on the [ObjectDetector] interface.
@@ -41,8 +53,6 @@ import kotlin.math.min
 class TFLiteObjectDetector(
     private val context: Context,
     private val modelAssetPath: String = "models/model.tflite",
-    private val labelNames: List<String> = CocoLabels.NAMES,
-    private val relevantClasses: Map<Int, com.auraguard.app.core.ObjectClass> = CocoLabels.RELEVANT_CLASSES,
     private val confidenceThresholdProvider: () -> Float = { 0.45f }
 ) : ObjectDetector {
 
@@ -55,9 +65,14 @@ class TFLiteObjectDetector(
     private var interpreter: Interpreter? = null
     private var inputW = 640
     private var inputH = 640
-    private var numClasses = labelNames.size
+    private var numClasses = 0
     private var numBoxes = 0
     private var transposedOutput = false // true: [1, 4+numClasses, numBoxes]; false: [1, numBoxes, 4+numClasses]
+
+    // Chosen automatically in loadModel() once numClasses is known — see class doc above.
+    private var activeLabelNames: List<String> = CocoLabels.NAMES
+    private var activeRelevantClasses: Map<Int, com.auraguard.app.core.ObjectClass> = CocoLabels.RELEVANT_CLASSES
+    private var activeLabelSetName: String = "COCO"
 
     private val nmsIouThreshold = 0.45f
 
@@ -93,7 +108,27 @@ class TFLiteObjectDetector(
                 }
             }
 
-            modelInfo = "TFLite ${inputW}x$inputH · $numClasses classes · $numBoxes anchors"
+            when (numClasses) {
+                CocoLabels.NAMES.size -> {
+                    activeLabelNames = CocoLabels.NAMES
+                    activeRelevantClasses = CocoLabels.RELEVANT_CLASSES
+                    activeLabelSetName = "COCO"
+                }
+                VisDroneLabels.NAMES.size -> {
+                    activeLabelNames = VisDroneLabels.NAMES
+                    activeRelevantClasses = VisDroneLabels.RELEVANT_CLASSES
+                    activeLabelSetName = "VisDrone (aerial)"
+                }
+                else -> {
+                    // Unrecognized class count — surface every class as a generic OBJECT rather
+                    // than silently dropping every detection because no mapping matched.
+                    activeLabelNames = (0 until numClasses).map { "class_$it" }
+                    activeRelevantClasses = (0 until numClasses).associateWith { com.auraguard.app.core.ObjectClass.UNKNOWN }
+                    activeLabelSetName = "custom"
+                }
+            }
+
+            modelInfo = "TFLite ${inputW}x$inputH · $activeLabelSetName · $numClasses classes · $numBoxes anchors"
             _status.value = DetectorStatus.READY
         } catch (e: FileNotFoundException) {
             _status.value = DetectorStatus.NO_MODEL
@@ -172,7 +207,7 @@ class TFLiteObjectDetector(
                 }
             }
             if (bestClass < 0 || bestScore < threshold) continue
-            val mapped = relevantClasses[bestClass] ?: continue
+            val mapped = activeRelevantClasses[bestClass] ?: continue
 
             val cx = valueAt(b, 0); val cy = valueAt(b, 1)
             val w = valueAt(b, 2); val h = valueAt(b, 3)
