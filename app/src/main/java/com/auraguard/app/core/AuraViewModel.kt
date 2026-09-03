@@ -76,14 +76,17 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         DetectorProvider.create(application) { settings.value.detectionConfidenceThreshold }
 
     // One detector instance per armed zone, so detection runs only on that zone's cropped region.
-    // A stateful engine (MotionDetector rolls a reference frame forward) needs its own instance per
-    // zone — feeding it alternating crops from different zones would make every zone look like
-    // constant motion relative to the last. Created lazily, closed when a zone is removed.
+    // A stateful engine (MotionDetector maintains a background reference) needs its own instance
+    // per zone — feeding it alternating crops from different zones would make every zone look like
+    // constant motion relative to the last, and its grid resolution is sized to that zone's crop
+    // (see [detectorFor]) so a tightly-drawn zone isn't sampled at full-frame detail. Created
+    // lazily, closed when a zone is removed.
     private val zoneDetectors = mutableMapOf<String, ObjectDetector>()
 
-    private fun detectorFor(zoneId: String): ObjectDetector =
+    private fun detectorFor(zoneId: String, roiRect: NormRect): ObjectDetector =
         zoneDetectors.getOrPut(zoneId) {
-            DetectorProvider.create(appContext) { settings.value.detectionConfidenceThreshold }
+            val roiScale = kotlin.math.sqrt((roiRect.width * roiRect.height).coerceAtLeast(0f))
+            DetectorProvider.create(appContext, roiScale = roiScale) { settings.value.detectionConfidenceThreshold }
         }
 
     private val rateLimiter = FrameRateLimiter(ProcessingRate.MEDIUM.targetFps)
@@ -196,7 +199,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             val roiRect = NormRect(bbox[0], bbox[1], bbox[2], bbox[3])
             if (roiRect.width <= 0.01f || roiRect.height <= 0.01f) continue
             val roi = FrameProcessor.crop(frame, roiRect) ?: continue
-            val zoneDetections = detectorFor(zone.id).detect(roi).filter { it.confidence >= threshold }
+            val zoneDetections = detectorFor(zone.id, roiRect).detect(roi).filter { it.confidence >= threshold }
             for (d in zoneDetections) {
                 results += d.copy(box = mapRoiBoxToFrame(d.box, roiRect))
             }
@@ -461,6 +464,12 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         FrameProcessor.crop(frame, NormRect(bbox[0], bbox[1], bbox[2], bbox[3]))?.let {
             changeEngine.setBaseline(zoneId, it)
         }
+        // Also drop this zone's object detector so it re-calibrates from scratch on the next few
+        // frames. MotionDetector treats whatever it first sees as "empty zone" — if the zone was
+        // armed while something was already standing in it, that thing would otherwise be baked
+        // into the background forever and never get flagged. Resetting the baseline is the
+        // operator's way of saying "the zone is clear right now," so it should resync both engines.
+        zoneDetectors.remove(zoneId)?.close()
     }
 
     fun getChangeBaselineSnapshot(zoneId: String): Bitmap? = changeEngine.getBaselineSnapshot(zoneId)
