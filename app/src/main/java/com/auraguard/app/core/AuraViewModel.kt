@@ -19,13 +19,11 @@ import com.auraguard.app.events.AuraEvent
 import com.auraguard.app.events.EventRepository
 import com.auraguard.app.events.EventType
 import com.auraguard.app.perimeter.PerimeterEditState
-import com.auraguard.app.perimeter.PerimeterEngine
 import com.auraguard.app.perimeter.PolygonMath
 import com.auraguard.app.perimeter.Zone
 import com.auraguard.app.processing.FrameProcessor
 import com.auraguard.app.processing.FrameRateLimiter
 import com.auraguard.app.processing.InferenceFpsMeter
-import com.auraguard.app.tracking.CentroidTracker
 import com.auraguard.app.tracking.TrackedObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -44,8 +42,25 @@ import java.util.UUID
  * The pipeline orchestrator. Wires together every stage described in the
  * architecture:
  *
- *   Screen Capture -> Frame Processor -> AI Detector -> Object Tracker ->
- *   Perimeter Engine -> Change Detection Engine -> Event/Alert Engine -> UI
+ *   Screen Capture -> Frame Processor -> Change Detection Engine -> Event/Alert Engine -> UI
+ *
+ * Detection is deliberately NOT built on a per-object AI classifier + a
+ * frame-to-frame tracker with persistent IDs. Earlier revisions tried that
+ * (an "AI Detector" stage producing per-object boxes, an "Object Tracker"
+ * stage assigning IDs, a "Perimeter Engine" stage evaluating each tracked
+ * object's distance to the zone boundary) and it was unreliable in
+ * practice on real footage: a stationary real object could quietly vanish
+ * from tracking, a moving background (dust, heat shimmer, exposure
+ * hunting) could spawn phantom boxes, box coordinates could drift out of
+ * alignment after being carried through the tracker, and a track could
+ * outlive the object it was following. What's actually wanted, per spec,
+ * is simpler: watch each armed zone for a *change* — something entered,
+ * something moved — mark exactly where that change is, and raise the
+ * alert. That's a single, well-understood, robust primitive (baseline
+ * differencing with a slow-adapting reference — see
+ * `change/ChangeDetectionEngine.kt`), evaluated fresh every frame with no
+ * persistent identity to get out of sync — so there's no per-object ID to
+ * track, no track to lose, no track to leave stuck on screen.
  *
  * Every stage is a small, independently replaceable class; this
  * ViewModel's only job is to move a frame through them in order, at the
@@ -55,39 +70,20 @@ import java.util.UUID
  */
 class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
-    // Stored explicitly (rather than relying on the inherited getApplication()) so it's usable
-    // from ordinary member functions below, not just class-body property initializers.
-    private val appContext: Application = application
-
     val settingsRepository: SettingsRepository =
         (application as? AuraGuardApp)?.settingsRepository ?: SettingsRepository(application)
 
     private val captureManager = CaptureManager(application)
-    private val tracker = CentroidTracker()
-    private val perimeterEngine = PerimeterEngine()
     private val changeEngine = ChangeDetectionEngine()
     val alertManager = AlertManager(application)
     val eventRepository = EventRepository(application)
 
     // Kept only as a status/model-info probe for the UI (Settings "System Info", the top status
-    // bar) — actual detection no longer runs on this instance; see [detectorFor] and
-    // [detectWithinZones] below for why detection is scoped per-zone instead of one shared engine.
+    // bar), purely informational — whether a trained .tflite model happens to be bundled (see
+    // MODEL_SETUP.md). Detection itself no longer depends on this at all; every zone is watched by
+    // [changeEngine] instead (see [handleFrame]/[evaluateZone]).
     private val detector: ObjectDetector =
         DetectorProvider.create(application) { settings.value.detectionConfidenceThreshold }
-
-    // One detector instance per armed zone, so detection runs only on that zone's cropped region.
-    // A stateful engine (MotionDetector maintains a background reference) needs its own instance
-    // per zone — feeding it alternating crops from different zones would make every zone look like
-    // constant motion relative to the last, and its grid resolution is sized to that zone's crop
-    // (see [detectorFor]) so a tightly-drawn zone isn't sampled at full-frame detail. Created
-    // lazily, closed when a zone is removed.
-    private val zoneDetectors = mutableMapOf<String, ObjectDetector>()
-
-    private fun detectorFor(zoneId: String, roiRect: NormRect): ObjectDetector =
-        zoneDetectors.getOrPut(zoneId) {
-            val roiScale = kotlin.math.sqrt((roiRect.width * roiRect.height).coerceAtLeast(0f))
-            DetectorProvider.create(appContext, roiScale = roiScale) { settings.value.detectionConfidenceThreshold }
-        }
 
     private val rateLimiter = FrameRateLimiter(ProcessingRate.MEDIUM.targetFps)
     private val inferenceFpsMeter = InferenceFpsMeter()
@@ -128,9 +124,6 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val alertBanner: StateFlow<AlertBannerData?> get() = alertManager.banner
     val alertLevel: StateFlow<AlertLevel> get() = alertManager.highestActiveLevel
 
-    // Last per-track perimeter state, to detect SAFE -> APPROACHING -> BREACH transitions
-    // instead of re-alerting every single frame an object stays put.
-    private val lastObjectPerimeterState = mutableMapOf<Int, PerimeterState>()
     private val lastChangeAlertAtMs = mutableMapOf<String, Long>()
 
     init {
@@ -142,72 +135,85 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         // The UI always gets every captured frame for a smooth live view...
         _currentFrame.value = bitmap
 
-        // ...but expensive AI inference only runs at the configured sample rate.
+        // ...but expensive processing only runs at the configured sample rate.
         if (!rateLimiter.shouldProcess()) return
 
         withContext(Dispatchers.Default) {
-            val threshold = settings.value.detectionConfidenceThreshold
             val armedZones = _zones.value.filter { it.armed && it.isClosed }
-            val detections = detectWithinZones(bitmap, armedZones, threshold)
-            val tracked = tracker.update(detections)
+            val markers = mutableListOf<TrackedObject>()
+            var nextMarkerId = 1
 
-            val evaluation = perimeterEngine.evaluate(_zones.value, tracked)
-            val annotated = tracked.map { obj ->
-                val (state, zoneId) = evaluation.objectStates[obj.id] ?: (PerimeterState.SAFE to null)
-                obj.copy(perimeterState = state, relevantZoneId = zoneId)
-            }
-            _trackedObjects.value = annotated
-            _currentObjectsCount.value = annotated.size
-
-            _zones.update { zones ->
-                zones.map { z -> z.copy(currentState = evaluation.zoneStates[z.id] ?: PerimeterState.SAFE) }
-            }
-
-            for (obj in annotated) {
-                val prev = lastObjectPerimeterState[obj.id] ?: PerimeterState.SAFE
-                if (obj.perimeterState != prev) {
-                    onPerimeterTransition(obj, prev, obj.perimeterState, bitmap)
+            for (zone in armedZones) {
+                val marker = evaluateZone(zone, bitmap, nextMarkerId)
+                if (marker != null) {
+                    markers += marker
+                    nextMarkerId++
                 }
-                lastObjectPerimeterState[obj.id] = obj.perimeterState
             }
-            lastObjectPerimeterState.keys.retainAll(annotated.map { it.id }.toSet())
 
+            _trackedObjects.value = markers
+            _currentObjectsCount.value = markers.size
             _inferenceFps.value = inferenceFpsMeter.tick()
-
-            runChangeDetection(bitmap)
         }
     }
 
     /**
-     * Runs the AI Detector stage ONLY inside each armed zone's rectangular bounding box — never
-     * across the whole frame. This is what makes detection "work inside the zone and not before":
-     * an object standing anywhere outside every defined zone is never fed to the detector at all,
-     * so it can't produce a box, a track, a trail, or a count — there's simply nothing to report
-     * until the object is within a zone's region. With no armed zone defined yet, this returns no
-     * detections at all (nothing to scope detection to).
+     * Watches a single armed zone for a change against its saved baseline (see
+     * `change/ChangeDetectionEngine.kt`) and, if the zone changed this frame, marks exactly where
+     * and raises the CHANGE DETECTED alert (cooldown-gated so a change that's still there doesn't
+     * re-alert every single frame). Returns a fresh marker for the overlay when changed, or null.
      *
-     * Each zone gets its own [detectorFor] instance rather than sharing one across zones/the whole
-     * frame, since a stateful engine (MotionDetector) rolls a reference frame forward — reusing one
-     * instance across two different zones' crops would make each new zone's first frame look like
-     * violent motion relative to the previous zone's content.
+     * This intentionally does not track anything across frames — no ID is carried from one call to
+     * the next. Every call is a clean "does this zone differ from its baseline right now?" check,
+     * so the marker on screen always matches what's actually different *this* frame: it can't drift
+     * out of alignment with a moving object the way a tracked box can, and it can't outlive the
+     * object that caused it — the instant the frame stops differing from baseline, there's nothing
+     * to mark.
      */
-    private fun detectWithinZones(frame: Bitmap, armedZones: List<Zone>, threshold: Float): List<Detection> {
-        if (armedZones.isEmpty()) return emptyList()
-        val results = mutableListOf<Detection>()
-        for (zone in armedZones) {
-            val bbox = PolygonMath.boundingBox(zone.points)
-            val roiRect = NormRect(bbox[0], bbox[1], bbox[2], bbox[3])
-            if (roiRect.width <= 0.01f || roiRect.height <= 0.01f) continue
-            val roi = FrameProcessor.crop(frame, roiRect) ?: continue
-            val zoneDetections = detectorFor(zone.id, roiRect).detect(roi).filter { it.confidence >= threshold }
-            for (d in zoneDetections) {
-                results += d.copy(box = mapRoiBoxToFrame(d.box, roiRect))
-            }
+    private fun evaluateZone(zone: Zone, frame: Bitmap, markerId: Int): TrackedObject? {
+        val bbox = PolygonMath.boundingBox(zone.points)
+        val roiRect = NormRect(bbox[0], bbox[1], bbox[2], bbox[3])
+        if (roiRect.width <= 0.01f || roiRect.height <= 0.01f) {
+            setZoneState(zone.id, PerimeterState.SAFE)
+            return null
         }
-        return results
+        val roi = FrameProcessor.crop(frame, roiRect) ?: run {
+            setZoneState(zone.id, PerimeterState.SAFE)
+            return null
+        }
+
+        val s = settings.value
+        val effectiveThreshold = (s.changeDetectionThreshold * (1f - zone.sensitivity * 0.5f)).coerceIn(0.05f, 0.95f)
+        val result = changeEngine.evaluate(zone.id, roi, effectiveThreshold)
+
+        if (!result.changed) {
+            setZoneState(zone.id, PerimeterState.SAFE)
+            return null
+        }
+        setZoneState(zone.id, PerimeterState.BREACH)
+
+        val regionInRoi = changeEngine.changedRegionWithinRoi(result)
+        val box = if (regionInRoi != null) mapRoiBoxToFrame(regionInRoi, roiRect) else roiRect
+
+        maybeAlertChange(zone, roi, result.confidence)
+
+        return TrackedObject(
+            id = markerId,
+            objectClass = ObjectClass.UNKNOWN,
+            label = "CHANGE",
+            confidence = result.confidence,
+            box = box,
+            trail = emptyList(),
+            perimeterState = PerimeterState.BREACH,
+            relevantZoneId = zone.id
+        )
     }
 
-    /** Converts a detection box normalized to a zone's cropped ROI back into full-frame normalized coordinates. */
+    private fun setZoneState(zoneId: String, state: PerimeterState) {
+        _zones.update { zones -> zones.map { if (it.id == zoneId) it.copy(currentState = state) else it } }
+    }
+
+    /** Converts a box normalized to a zone's cropped ROI back into full-frame normalized coordinates. */
     private fun mapRoiBoxToFrame(box: NormRect, roi: NormRect): NormRect = NormRect(
         left = roi.left + box.left * roi.width,
         top = roi.top + box.top * roi.height,
@@ -215,148 +221,39 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         bottom = roi.top + box.bottom * roi.height
     )
 
-    private fun onPerimeterTransition(obj: TrackedObject, prev: PerimeterState, new: PerimeterState, frame: Bitmap) {
-        val zoneName = obj.relevantZoneId?.let { id -> _zones.value.firstOrNull { it.id == id }?.name }
-        // Only a classified PERSON/vehicle can raise the loud "PERIMETER BREACH"/"APPROACHING" siren.
-        // The current detector engine reports a class only when a real trained model is loaded
-        // (DetectorStatus.READY); the built-in MOTION CV fallback has no way to tell a person from a
-        // swaying curtain or a bag, so its detections are always ObjectClass.UNKNOWN. Alerting on
-        // every unclassified motion blob is exactly the false-alarm spam this guards against — those
-        // are still logged to the event log below (quietly, as OBJECT_DETECTED/INFORMATION) so nothing
-        // is silently dropped, but they never trigger the banner, tone, or vibration.
-        val isClassified = obj.objectClass != ObjectClass.UNKNOWN
-        when (new) {
-            PerimeterState.BREACH -> {
-                if (!isClassified) {
-                    eventRepository.addEvent(
-                        AuraEvent(
-                            id = UUID.randomUUID().toString(),
-                            timestampMillis = System.currentTimeMillis(),
-                            type = EventType.OBJECT_DETECTED,
-                            level = AlertLevel.INFORMATION,
-                            zoneName = zoneName,
-                            objectLabel = obj.label,
-                            trackId = obj.id,
-                            confidence = obj.confidence,
-                            message = "Unclassified motion entered Zone ${zoneName ?: "UNKNOWN"} " +
-                                "(no trained model loaded — cannot confirm person/vehicle, see MODEL_SETUP.md)"
-                        )
-                    )
-                    return
-                }
-                _criticalCount.update { it + 1 }
-                val snapshotPath = eventRepository.saveSnapshot(FrameProcessor.thumbnail(frame), "breach")
-                eventRepository.addEvent(
-                    AuraEvent(
-                        id = UUID.randomUUID().toString(),
-                        timestampMillis = System.currentTimeMillis(),
-                        type = EventType.BREACH,
-                        level = AlertLevel.CRITICAL,
-                        zoneName = zoneName,
-                        objectLabel = obj.label,
-                        trackId = obj.id,
-                        confidence = obj.confidence,
-                        message = "${obj.displayName} entered Zone ${zoneName ?: "UNKNOWN"}",
-                        snapshotPath = snapshotPath
-                    )
-                )
-                alertManager.raise(
-                    level = AlertLevel.CRITICAL,
-                    title = "PERIMETER BREACH",
-                    subtitle = "${obj.displayName} · Confidence: ${(obj.confidence * 100).toInt()}%",
-                    zoneName = zoneName,
-                    audibleEnabled = settings.value.audibleAlertsEnabled
-                )
-            }
-            PerimeterState.APPROACHING -> {
-                if (prev == PerimeterState.SAFE && isClassified) {
-                    _warningsCount.update { it + 1 }
-                    eventRepository.addEvent(
-                        AuraEvent(
-                            id = UUID.randomUUID().toString(),
-                            timestampMillis = System.currentTimeMillis(),
-                            type = EventType.APPROACHING,
-                            level = AlertLevel.WARNING,
-                            zoneName = zoneName,
-                            objectLabel = obj.label,
-                            trackId = obj.id,
-                            confidence = obj.confidence,
-                            message = "${obj.displayName} approaching Zone ${zoneName ?: "UNKNOWN"}"
-                        )
-                    )
-                    alertManager.raise(
-                        level = AlertLevel.WARNING,
-                        title = "OBJECT APPROACHING PERIMETER",
-                        subtitle = "${obj.displayName} · Confidence: ${(obj.confidence * 100).toInt()}%",
-                        zoneName = zoneName,
-                        audibleEnabled = settings.value.audibleAlertsEnabled
-                    )
-                }
-            }
-            PerimeterState.SAFE -> {
-                if (prev != PerimeterState.SAFE) {
-                    eventRepository.addEvent(
-                        AuraEvent(
-                            id = UUID.randomUUID().toString(),
-                            timestampMillis = System.currentTimeMillis(),
-                            type = EventType.OBJECT_DETECTED,
-                            level = AlertLevel.INFORMATION,
-                            zoneName = zoneName,
-                            objectLabel = obj.label,
-                            trackId = obj.id,
-                            confidence = obj.confidence,
-                            message = "${obj.displayName} left the perimeter area"
-                        )
-                    )
-                }
-            }
-        }
-    }
+    /** Raises the CHANGE DETECTED alert for a zone, throttled so a change that persists across many frames re-alerts periodically instead of every single frame. */
+    private fun maybeAlertChange(zone: Zone, roi: Bitmap, confidence: Float) {
+        val now = System.currentTimeMillis()
+        val last = lastChangeAlertAtMs[zone.id] ?: 0L
+        if (now - last < CHANGE_ALERT_COOLDOWN_MS) return
+        lastChangeAlertAtMs[zone.id] = now
 
-    private fun runChangeDetection(frame: Bitmap) {
         val s = settings.value
-        for (zone in _zones.value) {
-            if (!zone.armed || !zone.isClosed) continue
-            val bbox = PolygonMath.boundingBox(zone.points)
-            val roiRect = NormRect(bbox[0], bbox[1], bbox[2], bbox[3])
-            if (roiRect.width <= 0.01f || roiRect.height <= 0.01f) continue
-            val roi = FrameProcessor.crop(frame, roiRect) ?: continue
+        _warningsCount.update { it + 1 }
+        val currentSnapshot = eventRepository.saveSnapshot(roi, "change_current")
+        val baselineSnapshot = changeEngine.getBaselineSnapshot(zone.id)
+            ?.let { eventRepository.saveSnapshot(it, "change_baseline") }
 
-            val effectiveThreshold = (s.changeDetectionThreshold * (1f - zone.sensitivity * 0.5f)).coerceIn(0.05f, 0.95f)
-            val result = changeEngine.evaluate(zone.id, roi, effectiveThreshold)
-            if (!result.changed) continue
-
-            val now = System.currentTimeMillis()
-            val last = lastChangeAlertAtMs[zone.id] ?: 0L
-            if (now - last < CHANGE_ALERT_COOLDOWN_MS) continue
-            lastChangeAlertAtMs[zone.id] = now
-
-            _warningsCount.update { it + 1 }
-            val currentSnapshot = eventRepository.saveSnapshot(roi, "change_current")
-            val baselineSnapshot = changeEngine.getBaselineSnapshot(zone.id)
-                ?.let { eventRepository.saveSnapshot(it, "change_baseline") }
-
-            eventRepository.addEvent(
-                AuraEvent(
-                    id = UUID.randomUUID().toString(),
-                    timestampMillis = now,
-                    type = EventType.CHANGE_DETECTED,
-                    level = AlertLevel.WARNING,
-                    zoneName = zone.name,
-                    confidence = result.confidence,
-                    message = "Significant visual change detected in Zone ${zone.name}",
-                    snapshotPath = currentSnapshot,
-                    baselineSnapshotPath = baselineSnapshot
-                )
-            )
-            alertManager.raise(
+        eventRepository.addEvent(
+            AuraEvent(
+                id = UUID.randomUUID().toString(),
+                timestampMillis = now,
+                type = EventType.CHANGE_DETECTED,
                 level = AlertLevel.WARNING,
-                title = "CHANGE DETECTED",
-                subtitle = "Zone ${zone.name} · Change confidence: ${(result.confidence * 100).toInt()}%",
                 zoneName = zone.name,
-                audibleEnabled = s.audibleAlertsEnabled
+                confidence = confidence,
+                message = "Change detected in Zone ${zone.name} — something entered or moved",
+                snapshotPath = currentSnapshot,
+                baselineSnapshotPath = baselineSnapshot
             )
-        }
+        )
+        alertManager.raise(
+            level = AlertLevel.WARNING,
+            title = "CHANGE DETECTED",
+            subtitle = "Zone ${zone.name} · Change confidence: ${(confidence * 100).toInt()}%",
+            zoneName = zone.name,
+            audibleEnabled = s.audibleAlertsEnabled
+        )
     }
 
     // ---- Perimeter definition (DEFINE PERIMETER UI) ----------------------------------------
@@ -439,11 +336,15 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Zone management (ZONES screen) -----------------------------------------------------
 
     fun setZoneArmed(zoneId: String, armed: Boolean) {
-        _zones.update { zones -> zones.map { if (it.id == zoneId) it.copy(armed = armed) else it } }
-        // Disarmed zones are never fed to detectWithinZones any more, so their detector instance
-        // (and, for MotionDetector, its rolling reference frame) is stale the moment it's unused —
-        // drop it now rather than leave it idle; re-arming lazily creates a fresh one via detectorFor.
-        if (!armed) zoneDetectors.remove(zoneId)?.close()
+        _zones.update { zones ->
+            zones.map {
+                if (it.id != zoneId) it
+                // A disarmed zone is no longer evaluated each frame, so nothing will ever flip its
+                // currentState back to SAFE on its own — reset it here so a zone that happened to be
+                // showing a change right when it was disarmed doesn't stay tinted red forever.
+                else it.copy(armed = armed, currentState = if (armed) it.currentState else PerimeterState.SAFE)
+            }
+        }
     }
 
     fun setZoneSensitivity(zoneId: String, sensitivity: Float) {
@@ -454,7 +355,6 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _zones.update { zones -> zones.filterNot { it.id == zoneId } }
         changeEngine.clearZone(zoneId)
         lastChangeAlertAtMs.remove(zoneId)
-        zoneDetectors.remove(zoneId)?.close()
     }
 
     fun resetZoneBaseline(zoneId: String) {
@@ -464,12 +364,6 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         FrameProcessor.crop(frame, NormRect(bbox[0], bbox[1], bbox[2], bbox[3]))?.let {
             changeEngine.setBaseline(zoneId, it)
         }
-        // Also drop this zone's object detector so it re-calibrates from scratch on the next few
-        // frames. MotionDetector treats whatever it first sees as "empty zone" — if the zone was
-        // armed while something was already standing in it, that thing would otherwise be baked
-        // into the background forever and never get flagged. Resetting the baseline is the
-        // operator's way of saying "the zone is clear right now," so it should resync both engines.
-        zoneDetectors.remove(zoneId)?.close()
     }
 
     fun getChangeBaselineSnapshot(zoneId: String): Bitmap? = changeEngine.getBaselineSnapshot(zoneId)
@@ -491,10 +385,8 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopMonitoring() {
         captureManager.stopAll()
-        tracker.reset()
         _trackedObjects.value = emptyList()
         _currentFrame.value = null
-        lastObjectPerimeterState.clear()
     }
 
     fun dismissAlertBanner() = alertManager.dismissBanner()
@@ -514,8 +406,6 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         detector.close()
-        zoneDetectors.values.forEach { it.close() }
-        zoneDetectors.clear()
         alertManager.release()
         captureManager.stopAll()
     }
