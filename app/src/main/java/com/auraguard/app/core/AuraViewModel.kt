@@ -158,8 +158,33 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun onPerimeterTransition(obj: TrackedObject, prev: PerimeterState, new: PerimeterState, frame: Bitmap) {
         val zoneName = obj.relevantZoneId?.let { id -> _zones.value.firstOrNull { it.id == id }?.name }
+        // Only a classified PERSON/vehicle can raise the loud "PERIMETER BREACH"/"APPROACHING" siren.
+        // The current detector engine reports a class only when a real trained model is loaded
+        // (DetectorStatus.READY); the built-in MOTION CV fallback has no way to tell a person from a
+        // swaying curtain or a bag, so its detections are always ObjectClass.UNKNOWN. Alerting on
+        // every unclassified motion blob is exactly the false-alarm spam this guards against — those
+        // are still logged to the event log below (quietly, as OBJECT_DETECTED/INFORMATION) so nothing
+        // is silently dropped, but they never trigger the banner, tone, or vibration.
+        val isClassified = obj.objectClass != ObjectClass.UNKNOWN
         when (new) {
             PerimeterState.BREACH -> {
+                if (!isClassified) {
+                    eventRepository.addEvent(
+                        AuraEvent(
+                            id = UUID.randomUUID().toString(),
+                            timestampMillis = System.currentTimeMillis(),
+                            type = EventType.OBJECT_DETECTED,
+                            level = AlertLevel.INFORMATION,
+                            zoneName = zoneName,
+                            objectLabel = obj.label,
+                            trackId = obj.id,
+                            confidence = obj.confidence,
+                            message = "Unclassified motion entered Zone ${zoneName ?: "UNKNOWN"} " +
+                                "(no trained model loaded — cannot confirm person/vehicle, see MODEL_SETUP.md)"
+                        )
+                    )
+                    return
+                }
                 _criticalCount.update { it + 1 }
                 val snapshotPath = eventRepository.saveSnapshot(FrameProcessor.thumbnail(frame), "breach")
                 eventRepository.addEvent(
@@ -185,7 +210,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             PerimeterState.APPROACHING -> {
-                if (prev == PerimeterState.SAFE) {
+                if (prev == PerimeterState.SAFE && isClassified) {
                     _warningsCount.update { it + 1 }
                     eventRepository.addEvent(
                         AuraEvent(
