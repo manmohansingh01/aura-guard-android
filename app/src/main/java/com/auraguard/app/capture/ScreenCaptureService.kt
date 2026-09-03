@@ -24,6 +24,7 @@ import androidx.core.app.NotificationCompat
 import com.auraguard.app.AuraGuardApp
 import com.auraguard.app.MainActivity
 import com.auraguard.app.R
+import com.auraguard.app.overlay.OverlayController
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -43,6 +44,7 @@ class ScreenCaptureService : Service() {
     private var imageReader: ImageReader? = null
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
+    private var overlayController: OverlayController? = null
 
     private var screenWidth = 0
     private var screenHeight = 0
@@ -99,11 +101,31 @@ class ScreenCaptureService : Service() {
             projection.registerCallback(projectionCallback, null)
             startVirtualDisplay(projection)
             CaptureBus.setState(CaptureState.ACTIVE)
+            maybeStartOverlay()
         } catch (t: Throwable) {
             CaptureBus.setState(CaptureState.ERROR)
             stopCapture()
             stopSelf()
         }
+    }
+
+    /**
+     * Draws detections/perimeter/alerts + a floating control bubble
+     * directly on top of whatever app is on screen (see OverlayController),
+     * so the operator doesn't have to keep AURA Guard itself in the
+     * foreground to see the live pipeline. Purely additive: if "draw over
+     * other apps" hasn't been granted, capture proceeds exactly as before
+     * and only the in-app Live screen shows the feed.
+     */
+    private fun maybeStartOverlay() {
+        if (!android.provider.Settings.canDrawOverlays(this)) return
+        val app = application as? AuraGuardApp ?: return
+        val controller = overlayController ?: OverlayController(
+            appContext = applicationContext,
+            viewModel = app.auraViewModel,
+            onRequestStopCapture = { startService(stopIntent(this@ScreenCaptureService)) }
+        ).also { overlayController = it }
+        controller.start()
     }
 
     private fun startVirtualDisplay(projection: MediaProjection) {
@@ -210,6 +232,8 @@ class ScreenCaptureService : Service() {
             handlerThread?.quitSafely()
             handlerThread = null
             handler = null
+            overlayController?.stop()
+            overlayController = null
         }
     }
 
