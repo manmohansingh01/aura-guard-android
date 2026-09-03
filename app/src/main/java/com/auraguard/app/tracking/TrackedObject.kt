@@ -18,7 +18,16 @@ data class TrackedObject(
     /** Zone id this object is currently interacting with (breaching/approaching), if any. */
     val relevantZoneId: String? = null,
     val framesSinceSeen: Int = 0,
-    val velocity: NormPoint = NormPoint(0f, 0f)
+    val velocity: NormPoint = NormPoint(0f, 0f),
+    /**
+     * Consecutive frames this track has been matched to a fresh detection,
+     * starting at 1 the frame it first appears. [CentroidTracker] only
+     * reports a track once this reaches its confirmation threshold, so a
+     * single-frame flicker (camera shake, a lighting change) never becomes
+     * a visible box, a trail line, or a perimeter alert — only something
+     * that keeps showing up frame after frame does.
+     */
+    val hitStreak: Int = 1
 ) {
     val displayName: String get() = "${label} #${id.toString().padStart(2, '0')}"
 }

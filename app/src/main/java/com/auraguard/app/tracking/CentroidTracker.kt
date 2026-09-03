@@ -21,7 +21,16 @@ import kotlin.math.sqrt
 class CentroidTracker(
     private val maxFramesLost: Int = 8,
     private val maxTrailLength: Int = 14,
-    private val matchDistanceThreshold: Float = 0.18f
+    private val matchDistanceThreshold: Float = 0.18f,
+    /**
+     * Frames a track must be matched to a fresh detection before it is
+     * reported to the rest of the app (rendered, or eligible for a
+     * perimeter alert). Kills one-off ghost boxes from camera shake or a
+     * single noisy frame — a real object stays matched frame after frame
+     * and clears this in well under a second at the app's sample rates; a
+     * shake artifact almost never does.
+     */
+    private val confirmFrames: Int = 3
 ) {
     private var nextId = 1
     private val tracks = LinkedHashMap<Int, TrackedObject>()
@@ -66,7 +75,8 @@ class CentroidTracker(
                 box = det.box,
                 trail = trail,
                 framesSinceSeen = 0,
-                velocity = velocity
+                velocity = velocity,
+                hitStreak = prev.hitStreak + 1
             )
         }
 
@@ -96,9 +106,12 @@ class CentroidTracker(
         tracks.clear()
         tracks.putAll(updated)
 
-        // Only objects seen in *this* frame are reported as "currently visible" to the UI/perimeter
-        // engine; briefly-occluded ones stay in `tracks` internally so their ID/trail survives.
-        return tracks.values.filter { it.framesSinceSeen == 0 }
+        // Only objects seen in *this* frame, and matched for `confirmFrames` frames running, are
+        // reported as "currently visible" to the UI/perimeter engine. Briefly-occluded tracks stay
+        // in `tracks` internally so their ID/trail/streak survives; not-yet-confirmed ones do too,
+        // so a genuine object still appears within a couple of frames instead of restarting its
+        // streak from zero.
+        return tracks.values.filter { it.framesSinceSeen == 0 && it.hitStreak >= confirmFrames }
     }
 
     fun reset() {
