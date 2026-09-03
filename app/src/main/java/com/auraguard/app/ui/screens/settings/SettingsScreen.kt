@@ -1,5 +1,8 @@
 package com.auraguard.app.ui.screens.settings
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings as AndroidSettings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -13,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Slider
@@ -21,17 +25,26 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.auraguard.app.core.AuraViewModel
 import com.auraguard.app.core.ProcessingRate
 import com.auraguard.app.ui.theme.OpsAccent
 import com.auraguard.app.ui.theme.OpsBackground
 import com.auraguard.app.ui.theme.OpsBackground as Bg
+import com.auraguard.app.ui.theme.OpsCritical
 import com.auraguard.app.ui.theme.OpsInfo
 import com.auraguard.app.ui.theme.OpsSurface
 import com.auraguard.app.ui.theme.OpsTextPrimary
@@ -42,6 +55,19 @@ fun SettingsScreen(viewModel: AuraViewModel) {
     val settings by viewModel.settings.collectAsState()
     val inferenceFps by viewModel.inferenceFps.collectAsState()
     val detectorStatus by viewModel.detectorStatus.collectAsState()
+
+    val context = LocalContext.current
+    var overlayGranted by remember { mutableStateOf(AndroidSettings.canDrawOverlays(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                overlayGranted = AndroidSettings.canDrawOverlays(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Column(
         modifier = Modifier
@@ -108,6 +134,42 @@ fun SettingsScreen(viewModel: AuraViewModel) {
                     onCheckedChange = { viewModel.setAudibleAlerts(it) },
                     colors = SwitchDefaults.colors(checkedTrackColor = OpsAccent)
                 )
+            }
+        }
+
+        SectionCard("FLOATING OVERLAY") {
+            Text(
+                "Lets AURA Guard draw detections, perimeter zones, alerts, and a DEFINE PERIMETER " +
+                    "control directly on top of your drone app, so you never have to switch away from " +
+                    "the live feed to see them. Requires the \"draw over other apps\" system permission.",
+                color = OpsTextSecondary, fontSize = 11.sp
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    if (overlayGranted) "GRANTED — overlay appears automatically while capture is active" else "NOT GRANTED",
+                    color = if (overlayGranted) OpsAccent else OpsCritical,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            if (!overlayGranted) {
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        context.startActivity(
+                            Intent(
+                                AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${context.packageName}")
+                            )
+                        )
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = OpsAccent, contentColor = OpsBackground)
+                ) { Text("ENABLE OVERLAY", fontSize = 12.sp) }
             }
         }
 
